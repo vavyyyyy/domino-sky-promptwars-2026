@@ -41,7 +41,6 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
     throw new Error('Dataset root must be a JSON object.');
   }
 
-  // Validate meta
   if (!isRecord(input.meta)) {
     throw new Error('Missing or invalid "meta" object.');
   }
@@ -58,7 +57,6 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
     throw new Error('meta turnaround and seats_per_aircraft must be valid positive constraints.');
   }
 
-  // Validate airports
   if (!Array.isArray(input.airports) || input.airports.length === 0) {
     throw new Error('"airports" must be a non-empty array.');
   }
@@ -75,22 +73,31 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
       throw new Error(`${ctx}: invalid tier "${tier}".`);
     }
 
+    const lat = assertFiniteNumber(item, 'lat', ctx);
+    const lng = assertFiniteNumber(item, 'lng', ctx);
+    const capacity_per_hour = assertFiniteNumber(item, 'capacity_per_hour', ctx);
+    if (lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      throw new Error(`${ctx} (${id}): lat/lng coordinates out of valid geographic range.`);
+    }
+    if (capacity_per_hour <= 0) {
+      throw new Error(`${ctx} (${id}): capacity_per_hour must be positive.`);
+    }
+
     return {
       id,
       name: assertString(item, 'name', ctx),
       city: assertString(item, 'city', ctx),
-      lat: assertFiniteNumber(item, 'lat', ctx),
-      lng: assertFiniteNumber(item, 'lng', ctx),
+      lat,
+      lng,
       tier,
-      capacity_per_hour: assertFiniteNumber(item, 'capacity_per_hour', ctx),
+      capacity_per_hour,
     };
   });
 
-  // Validate flights
   if (!Array.isArray(input.flights) || input.flights.length === 0) {
     throw new Error('"flights" must be a non-empty array.');
   }
-  const flightIds = new Set<string>();
+  const flightMap = new Map<string, RawFlight>();
   const flightsByTail = new Map<string, RawFlight[]>();
 
   const flights: RawFlight[] = input.flights.map((item, idx) => {
@@ -98,11 +105,14 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
     if (!isRecord(item)) throw new Error(`${ctx} must be an object.`);
 
     const flight_id = assertString(item, 'flight_id', ctx);
-    if (flightIds.has(flight_id)) throw new Error(`Duplicate flight_id "${flight_id}".`);
-    flightIds.add(flight_id);
+    if (flightMap.has(flight_id)) throw new Error(`Duplicate flight_id "${flight_id}".`);
 
     const tail_id = assertString(item, 'tail_id', ctx);
     const leg_order = assertFiniteNumber(item, 'leg_order', ctx);
+    if (!Number.isInteger(leg_order) || leg_order < 1) {
+      throw new Error(`${ctx} (${flight_id}): leg_order must be a positive integer.`);
+    }
+
     const origin = assertString(item, 'origin', ctx);
     const destination = assertString(item, 'destination', ctx);
     const dep = assertString(item, 'dep', ctx);
@@ -122,13 +132,15 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
 
     const depMins = parseTimeToMinutes(dep);
     const arrMins = parseTimeToMinutes(arr);
-    if (arrMins - depMins !== block_minutes) {
+    if (block_minutes <= 0 || arrMins - depMins !== block_minutes) {
       throw new Error(
         `${ctx} (${flight_id}): arr (${arr}) - dep (${dep}) = ${arrMins - depMins}m does not match block_minutes (${block_minutes}m).`
       );
     }
     if (pax < 0 || pax > meta.seats_per_aircraft) {
-      throw new Error(`${ctx} (${flight_id}): pax (${pax}) out of range [0, ${meta.seats_per_aircraft}].`);
+      throw new Error(
+        `${ctx} (${flight_id}): pax (${pax}) out of range [0, ${meta.seats_per_aircraft}].`
+      );
     }
 
     const rawTurnaround = item.turnaround_before_min;
@@ -136,7 +148,9 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
       rawTurnaround !== null &&
       (typeof rawTurnaround !== 'number' || !Number.isFinite(rawTurnaround) || rawTurnaround < 0)
     ) {
-      throw new Error(`${ctx} (${flight_id}): turnaround_before_min must be null or a non-negative number.`);
+      throw new Error(
+        `${ctx} (${flight_id}): turnaround_before_min must be null or a non-negative number.`
+      );
     }
 
     const flight: RawFlight = {
@@ -152,6 +166,7 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
       turnaround_before_min: rawTurnaround,
     };
 
+    flightMap.set(flight_id, flight);
     const existing = flightsByTail.get(tail_id) ?? [];
     existing.push(flight);
     flightsByTail.set(tail_id, existing);
@@ -159,7 +174,7 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
     return flight;
   });
 
-  // Verify aircraft leg continuity & uniqueness
+  // Verify aircraft leg continuity, sequential numbering, and realistic rotations (no teleportation)
   for (const [tailId, tailFlights] of flightsByTail.entries()) {
     const sorted = [...tailFlights].sort((a, b) => a.leg_order - b.leg_order);
     for (let i = 0; i < sorted.length; i++) {
@@ -174,7 +189,6 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
     }
   }
 
-  // Validate connections
   if (!Array.isArray(input.connections)) {
     throw new Error('"connections" must be an array.');
   }
@@ -198,14 +212,26 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
     if (!airportIds.has(airport)) {
       throw new Error(`${ctx} (${connection_id}): unknown airport "${airport}".`);
     }
-    if (!flightIds.has(from_flight)) {
+    const fromFlight = flightMap.get(from_flight);
+    const toFlight = flightMap.get(to_flight);
+    if (!fromFlight) {
       throw new Error(`${ctx} (${connection_id}): unknown from_flight "${from_flight}".`);
     }
-    if (!flightIds.has(to_flight)) {
+    if (!toFlight) {
       throw new Error(`${ctx} (${connection_id}): unknown to_flight "${to_flight}".`);
     }
+    if (from_flight === to_flight) {
+      throw new Error(`${ctx} (${connection_id}): from_flight and to_flight cannot be identical.`);
+    }
+    if (fromFlight.destination !== airport || toFlight.origin !== airport) {
+      throw new Error(
+        `${ctx} (${connection_id}): connection hub "${airport}" does not match ${from_flight} (${fromFlight.destination}) -> ${to_flight} (${toFlight.origin}).`
+      );
+    }
     if (passengers < 0 || min_connect_minutes < 0) {
-      throw new Error(`${ctx} (${connection_id}): passengers and min_connect_minutes must be non-negative.`);
+      throw new Error(
+        `${ctx} (${connection_id}): passengers and min_connect_minutes must be non-negative.`
+      );
     }
 
     return {
@@ -218,7 +244,6 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
     };
   });
 
-  // Validate crews
   if (!Array.isArray(input.crews)) {
     throw new Error('"crews" must be an array.');
   }
@@ -234,19 +259,33 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
     const tail_id = assertString(item, 'tail_id', ctx);
     const base = assertString(item, 'base', ctx);
     const duty_start = assertString(item, 'duty_start', ctx);
-    parseTimeToMinutes(duty_start);
+    const dutyStartMins = parseTimeToMinutes(duty_start);
     const max_duty_mins = assertFiniteNumber(item, 'max_duty_mins', ctx);
 
     if (!airportIds.has(base)) {
       throw new Error(`${ctx} (${crew_id}): unknown base "${base}".`);
+    }
+    if (max_duty_mins <= 0) {
+      throw new Error(`${ctx} (${crew_id}): max_duty_mins must be positive.`);
     }
     if (!Array.isArray(item.flight_ids) || item.flight_ids.length === 0) {
       throw new Error(`${ctx} (${crew_id}): flight_ids must be a non-empty array.`);
     }
 
     const flight_ids = item.flight_ids.map((fid, fIdx) => {
-      if (typeof fid !== 'string' || !flightIds.has(fid)) {
+      if (typeof fid !== 'string' || !flightMap.has(fid)) {
         throw new Error(`${ctx} (${crew_id}): invalid flight_id at index ${fIdx}.`);
+      }
+      const assignedFlight = flightMap.get(fid)!;
+      if (assignedFlight.tail_id !== tail_id) {
+        throw new Error(
+          `${ctx} (${crew_id}): flight "${fid}" belongs to ${assignedFlight.tail_id}, expected ${tail_id}.`
+        );
+      }
+      if (parseTimeToMinutes(assignedFlight.dep) < dutyStartMins) {
+        throw new Error(
+          `${ctx} (${crew_id}): flight "${fid}" departs before crew duty_start (${duty_start}).`
+        );
       }
       return fid;
     });
@@ -261,7 +300,6 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
     };
   });
 
-  // Validate spare aircraft
   if (!Array.isArray(input.spare_aircraft)) {
     throw new Error('"spare_aircraft" must be an array.');
   }
@@ -272,6 +310,9 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
 
     const tail_id = assertString(item, 'tail_id', ctx);
     if (spareIds.has(tail_id)) throw new Error(`Duplicate spare tail_id "${tail_id}".`);
+    if (flightsByTail.has(tail_id)) {
+      throw new Error(`${ctx} (${tail_id}): spare tail_id collides with active scheduled tail.`);
+    }
     spareIds.add(tail_id);
 
     const base = assertString(item, 'base', ctx);
@@ -281,6 +322,9 @@ export function validateFlightNetworkDataset(input: unknown): FlightNetworkDatas
     const available_from = assertString(item, 'available_from', ctx);
     parseTimeToMinutes(available_from);
     const seats = assertFiniteNumber(item, 'seats', ctx);
+    if (seats <= 0) {
+      throw new Error(`${ctx} (${tail_id}): seats must be positive.`);
+    }
 
     return {
       tail_id,

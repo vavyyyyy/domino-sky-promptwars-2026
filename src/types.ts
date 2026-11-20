@@ -202,3 +202,157 @@ export interface SimulationResult {
   airportImpacts: AirportImpactSummary[];
   kpis: SimulationKPIs;
 }
+
+export type TimelineEventType =
+  | 'DISRUPTION_ORIGIN'
+  | 'FLIGHT_DELAY'
+  | 'ROTATION_CASCADE'
+  | 'CONNECTION_FAILURE'
+  | 'CREW_VIOLATION'
+  | 'RECOVERY_ACTION';
+
+export type TimelineStageKind =
+  | 'ORIGINAL_EVENT'
+  | 'PREDICTED_IMPACT'
+  | 'RECOVERY_ACTION';
+
+export interface DominoTimelineEvent {
+  id: string;
+  sequence: number;
+  timeMins: number;
+  timeLabel: string;
+  endTimeMins?: number;
+  endTimeLabel?: string;
+  type: TimelineEventType;
+  stageKind: TimelineStageKind;
+  severity: 'critical' | 'warning' | 'info' | 'recovery';
+  title: string;
+  description: string;
+  airportId: string;
+  targetAirportId?: string;
+  flightId?: string;
+  tailId?: string;
+  crewId?: string;
+  connectionId?: string;
+  delayMinutes?: number;
+  passengersAffected?: number;
+  causedByEventId?: string;
+  sourceTailId?: string;
+}
+
+export type RecoveryActionType =
+  | 'DEPLOY_SPARE_TAIL_SUFFIX'
+  | 'SWAP_TAIL_SUFFIXES'
+  | 'HOLD_CONNECTING_FLIGHT';
+
+export interface DeploySpareTailAction {
+  type: 'DEPLOY_SPARE_TAIL_SUFFIX';
+  spareTailId: string;
+  targetTailId: string;
+  fromFlightId: string;
+}
+
+export interface SwapTailSuffixesAction {
+  type: 'SWAP_TAIL_SUFFIXES';
+  tailAId: string;
+  fromFlightAId: string;
+  tailBId: string;
+  fromFlightBId: string;
+  hubAirportId: string;
+}
+
+export interface HoldConnectingFlightAction {
+  type: 'HOLD_CONNECTING_FLIGHT';
+  connectionId: string;
+  flightId: string;
+  holdMinutes: number;
+}
+
+export type RecoveryAction =
+  | DeploySpareTailAction
+  | SwapTailSuffixesAction
+  | HoldConnectingFlightAction;
+
+export interface ConstraintCheckItem {
+  name: string;
+  passed: boolean;
+  detail: string;
+}
+
+export interface RecoveryValidationResult {
+  valid: boolean;
+  reasons: string[];
+  checks: ConstraintCheckItem[];
+  recoveredDataset: FlightNetworkDataset | null;
+  simulationResult: SimulationResult | null;
+  reassignedFlightsCount: number;
+  rescheduledFlightsCount: number;
+}
+
+export interface RecoveryScoreBreakdown {
+  delayReductionScore: number;       // max 30
+  passengerProtectionScore: number;  // max 30
+  crewLegalityScore: number;         // max 20
+  aircraftFeasibilityScore: number;  // max 10
+  operationalSimplicityScore: number;// max 10
+  totalScore: number;                // 0 - 100
+  formulaNotes: string[];
+}
+
+export interface BeforeAfterComparison {
+  disrupted: {
+    totalDelayMinutes: number;
+    delayedFlights: number;
+    cancelledFlights: number;
+    strandedPassengers: number;
+    failedConnectionsCount: number;
+    crewViolationsCount: number;
+    averageAircraftUtilisationPct: number;
+  };
+  recovered: {
+    totalDelayMinutes: number;
+    delayedFlights: number;
+    cancelledFlights: number;
+    strandedPassengers: number;
+    failedConnectionsCount: number;
+    crewViolationsCount: number;
+    averageAircraftUtilisationPct: number;
+  };
+  deltas: {
+    delayMinutesSaved: number;
+    delayMinutesPctReduction: number | null;
+    delayedFlightsReduced: number;
+    delayedFlightsPctReduction: number | null;
+    cancelledFlightsDelta: number;
+    strandedPassengersSaved: number;
+    strandedPassengersPctReduction: number | null;
+    failedConnectionsSaved: number;
+    crewViolationsReduced: number;
+    crewViolationsPctReduction: number | null;
+    aircraftUtilisationDeltaPct: number;
+    flightsRecoveredCount: number;
+    flightsRestoredOnTimeCount: number;
+  };
+}
+
+export type RecoveryStrategyCategory =
+  | 'SPARE_AIRCRAFT'
+  | 'TAIL_SWAP'
+  | 'CONNECTION_HOLD'
+  | 'COMPOSITE_RECOVERY';
+
+export interface RecoveryStrategyCandidate {
+  id: string;
+  title: string;
+  category: RecoveryStrategyCategory;
+  summary: string;
+  rationale: string;
+  actions: RecoveryAction[];
+  actionDescriptions: string[];
+  validation: RecoveryValidationResult;
+  simulationResult: SimulationResult;
+  comparison: BeforeAfterComparison;
+  scorecard: RecoveryScoreBreakdown;
+  recommended: boolean;
+}
+

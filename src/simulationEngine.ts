@@ -19,6 +19,12 @@ import type {
   SimulationResult,
 } from './types';
 
+interface MergedClosureWindow {
+  startMins: number;
+  endMins: number;
+  labels: string[];
+}
+
 function normalizeClosures(
   closures: AirportClosureInput[],
   validAirportIds: ReadonlySet<string>
@@ -53,11 +59,44 @@ function normalizeClosures(
   });
 }
 
+/**
+ * Merges overlapping or contiguous half-open closure windows [start, end) per airport
+ * so fixed-point departure/arrival resolution always converges cleanly.
+ */
+function buildMergedClosuresByAirport(
+  normalizedClosures: NormalizedClosure[]
+): Map<string, MergedClosureWindow[]> {
+  const byAirport = new Map<string, MergedClosureWindow[]>();
+
+  for (const c of normalizedClosures) {
+    const label = `${c.startTime}-${c.endTime}`;
+    const list = byAirport.get(c.airportId) ?? [];
+    const last = list[list.length - 1];
+
+    if (last && c.startMins <= last.endMins) {
+      last.endMins = Math.max(last.endMins, c.endMins);
+      if (!last.labels.includes(label)) {
+        last.labels.push(label);
+      }
+    } else {
+      list.push({
+        startMins: c.startMins,
+        endMins: c.endMins,
+        labels: [label],
+      });
+    }
+
+    byAirport.set(c.airportId, list);
+  }
+
+  return byAirport;
+}
+
 function resolveFlightTiming(
   flight: RawFlight,
   prevFlightResult: FlightSimulationResult | null,
   minTurnaroundMinutes: number,
-  closuresByAirport: Map<string, NormalizedClosure[]>
+  mergedClosuresByAirport: Map<string, MergedClosureWindow[]>
 ): FlightSimulationResult {
   const scheduledDepMins = parseTimeToMinutes(flight.dep);
   const scheduledArrMins = parseTimeToMinutes(flight.arr);
@@ -78,12 +117,14 @@ function resolveFlightTiming(
     }
   }
 
-  const originClosures = closuresByAirport.get(flight.origin) ?? [];
-  const destClosures = closuresByAirport.get(flight.destination) ?? [];
+  const originClosures = mergedClosuresByAirport.get(flight.origin) ?? [];
+  const destClosures = mergedClosuresByAirport.get(flight.destination) ?? [];
 
   // Fixed-point solver: guarantees both departure at origin and arrival at destination
   // lie outside all closure windows [startMins, endMins), while preserving blockMinutes.
   const maxIterations = (originClosures.length + destClosures.length) * 4 + 10;
+  let converged = false;
+
   for (let iter = 0; iter < maxIterations; iter++) {
     let adjusted = false;
 
@@ -91,7 +132,7 @@ function resolveFlightTiming(
       if (actualDepMins >= closure.startMins && actualDepMins < closure.endMins) {
         actualDepMins = closure.endMins;
         reasonSet.add('ORIGIN_CLOSURE');
-        const note = `${flight.origin} dep closure (${closure.startTime}-${closure.endTime})`;
+        const note = `${flight.origin} dep closure (${closure.labels.join(', ')})`;
         if (!delayNotes.includes(note)) delayNotes.push(note);
         adjusted = true;
         break;
@@ -106,13 +147,23 @@ function resolveFlightTiming(
         // and scheduled block duration is preserved.
         actualDepMins = closure.endMins - blockMinutes;
         reasonSet.add('DESTINATION_CLOSURE');
-        const note = `${flight.destination} arr closure (${closure.startTime}-${closure.endTime})`;
+        const note = `${flight.destination} arr closure (${closure.labels.join(', ')})`;
         if (!delayNotes.includes(note)) delayNotes.push(note);
         adjusted = true;
         break;
       }
     }
-    if (!adjusted) break;
+
+    if (!adjusted) {
+      converged = true;
+      break;
+    }
+  }
+
+  if (!converged) {
+    throw new Error(
+      `Flight ${flight.flight_id} failed to converge outside airport closure windows.`
+    );
   }
 
   const actualArrMins = actualDepMins + blockMinutes;
@@ -143,61 +194,11 @@ function resolveFlightTiming(
   };
 }
 
-export function runSimulation(
+function evaluateConnections(
   dataset: FlightNetworkDataset,
-  closureInputs: AirportClosureInput[] = []
-): SimulationResult {
-  const validAirportIds = new Set(dataset.airports.map((a) => a.id));
-  const normalizedClosures = normalizeClosures(closureInputs, validAirportIds);
-
-  const closuresByAirport = new Map<string, NormalizedClosure[]>();
-  for (const c of normalizedClosures) {
-    const list = closuresByAirport.get(c.airportId) ?? [];
-    list.push(c);
-    closuresByAirport.set(c.airportId, list);
-  }
-
-  // Group flights by aircraft tail and sort strictly by leg_order
-  const flightsByTail = new Map<string, RawFlight[]>();
-  for (const flight of dataset.flights) {
-    const list = flightsByTail.get(flight.tail_id) ?? [];
-    list.push(flight);
-    flightsByTail.set(flight.tail_id, list);
-  }
-
-  const flightResultsById = new Map<string, FlightSimulationResult>();
-  const tailResultsMap = new Map<string, FlightSimulationResult[]>();
-
-  const sortedTailIds = Array.from(flightsByTail.keys()).sort((a, b) => a.localeCompare(b));
-  for (const tailId of sortedTailIds) {
-    const legs = [...(flightsByTail.get(tailId) ?? [])].sort((a, b) => a.leg_order - b.leg_order);
-    const resolvedLegs: FlightSimulationResult[] = [];
-    let prevLeg: FlightSimulationResult | null = null;
-
-    for (const leg of legs) {
-      const result = resolveFlightTiming(
-        leg,
-        prevLeg,
-        dataset.meta.min_turnaround_minutes,
-        closuresByAirport
-      );
-      resolvedLegs.push(result);
-      flightResultsById.set(result.flightId, result);
-      prevLeg = result;
-    }
-
-    tailResultsMap.set(tailId, resolvedLegs);
-  }
-
-  // Sort all flight results deterministically by scheduled departure, then tail/leg
-  const flightResults = Array.from(flightResultsById.values()).sort((a, b) => {
-    if (a.scheduledDepMins !== b.scheduledDepMins) return a.scheduledDepMins - b.scheduledDepMins;
-    if (a.tailId !== b.tailId) return a.tailId.localeCompare(b.tailId);
-    return a.legOrder - b.legOrder;
-  });
-
-  // Evaluate passenger connections; count each failed connection's passengers exactly once
-  const connectionResults: ConnectionSimulationResult[] = dataset.connections.map((conn) => {
+  flightResultsById: Map<string, FlightSimulationResult>
+): ConnectionSimulationResult[] {
+  return dataset.connections.map((conn) => {
     const fromFlight = flightResultsById.get(conn.from_flight);
     const toFlight = flightResultsById.get(conn.to_flight);
     if (!fromFlight || !toFlight) {
@@ -222,12 +223,13 @@ export function runSimulation(
       failed,
     };
   });
+}
 
-  const failedConnections = connectionResults.filter((c) => c.failed);
-  const strandedPassengers = failedConnections.reduce((sum, c) => sum + c.passengers, 0);
-
-  // Evaluate crew duty durations and flag max_duty_mins violations
-  const crewResults: CrewSimulationResult[] = dataset.crews.map((crew) => {
+function evaluateCrews(
+  dataset: FlightNetworkDataset,
+  flightResultsById: Map<string, FlightSimulationResult>
+): CrewSimulationResult[] {
+  return dataset.crews.map((crew) => {
     const dutyStartMins = parseTimeToMinutes(crew.duty_start);
     const crewFlights = crew.flight_ids.map((fid) => {
       const fr = flightResultsById.get(fid);
@@ -260,10 +262,16 @@ export function runSimulation(
       exceedsLimit,
     };
   });
+}
 
-  const crewViolations = crewResults.filter((c) => c.exceedsLimit);
-
-  // Compute aircraft utilisation for active fleet + spare aircraft
+function computeAircraftUtilisation(
+  dataset: FlightNetworkDataset,
+  sortedTailIds: string[],
+  tailResultsMap: Map<string, FlightSimulationResult[]>
+): {
+  activeUtilisation: AircraftUtilisationResult[];
+  spareUtilisation: AircraftUtilisationResult[];
+} {
   const crewBaseByTail = new Map<string, string>();
   for (const crew of dataset.crews) {
     crewBaseByTail.set(crew.tail_id, crew.base);
@@ -319,30 +327,19 @@ export function runSimulation(
       utilisation24hPct: 0,
     }));
 
-  const aircraftUtilisation = [...activeUtilisation, ...spareUtilisation];
+  return { activeUtilisation, spareUtilisation };
+}
 
-  // Airport-level impact summary
-  const airportImpacts: AirportImpactSummary[] = dataset.airports.map((airport) => {
-    const deps = flightResults.filter((f) => f.origin === airport.id);
-    const arrs = flightResults.filter((f) => f.destination === airport.id);
-    const failedAtAirport = failedConnections.filter((c) => c.airport === airport.id);
-
-    return {
-      airportId: airport.id,
-      city: airport.city,
-      tier: airport.tier,
-      departuresCount: deps.length,
-      arrivalsCount: arrs.length,
-      delayedDepartures: deps.filter((f) => f.delayMinutes > 0).length,
-      delayedArrivals: arrs.filter((f) => f.delayMinutes > 0).length,
-      totalDepartureDelayMinutes: deps.reduce((s, f) => s + f.delayMinutes, 0),
-      failedConnectionsAtAirport: failedAtAirport.length,
-      strandedPassengersAtAirport: failedAtAirport.reduce((s, c) => s + c.passengers, 0),
-      isClosed: closuresByAirport.has(airport.id),
-    };
-  });
-
-  // Derive overall KPIs strictly from simulation results
+function computeKPIs(
+  flightResults: FlightSimulationResult[],
+  connectionResults: ConnectionSimulationResult[],
+  failedConnections: ConnectionSimulationResult[],
+  strandedPassengers: number,
+  crewResults: CrewSimulationResult[],
+  crewViolations: CrewSimulationResult[],
+  activeUtilisation: AircraftUtilisationResult[],
+  spareUtilisation: AircraftUtilisationResult[]
+): SimulationKPIs {
   const totalFlights = flightResults.length;
   const delayedFlightList = flightResults.filter((f) => f.delayMinutes > 0);
   const delayedFlights = delayedFlightList.length;
@@ -362,7 +359,7 @@ export function runSimulation(
         )
       : 0;
 
-  const kpis: SimulationKPIs = {
+  return {
     totalFlights,
     onTimeFlights,
     delayedFlights,
@@ -386,6 +383,103 @@ export function runSimulation(
     spareAircraftCount: spareUtilisation.length,
     averageAircraftUtilisationPct,
   };
+}
+
+export function runSimulation(
+  dataset: FlightNetworkDataset,
+  closureInputs: AirportClosureInput[] = []
+): SimulationResult {
+  const validAirportIds = new Set(dataset.airports.map((a) => a.id));
+  const normalizedClosures = normalizeClosures(closureInputs, validAirportIds);
+  const mergedClosuresByAirport = buildMergedClosuresByAirport(normalizedClosures);
+
+  // Group flights by aircraft tail and sort strictly by leg_order
+  const flightsByTail = new Map<string, RawFlight[]>();
+  for (const flight of dataset.flights) {
+    const list = flightsByTail.get(flight.tail_id) ?? [];
+    list.push(flight);
+    flightsByTail.set(flight.tail_id, list);
+  }
+
+  const flightResultsById = new Map<string, FlightSimulationResult>();
+  const tailResultsMap = new Map<string, FlightSimulationResult[]>();
+
+  const sortedTailIds = Array.from(flightsByTail.keys()).sort((a, b) => a.localeCompare(b));
+  for (const tailId of sortedTailIds) {
+    const legs = [...(flightsByTail.get(tailId) ?? [])].sort((a, b) => a.leg_order - b.leg_order);
+    const resolvedLegs: FlightSimulationResult[] = [];
+    let prevLeg: FlightSimulationResult | null = null;
+
+    for (const leg of legs) {
+      const result = resolveFlightTiming(
+        leg,
+        prevLeg,
+        dataset.meta.min_turnaround_minutes,
+        mergedClosuresByAirport
+      );
+      resolvedLegs.push(result);
+      flightResultsById.set(result.flightId, result);
+      prevLeg = result;
+    }
+
+    tailResultsMap.set(tailId, resolvedLegs);
+  }
+
+  // Sort all flight results deterministically by scheduled departure, then tail/leg
+  const flightResults = Array.from(flightResultsById.values()).sort((a, b) => {
+    if (a.scheduledDepMins !== b.scheduledDepMins) return a.scheduledDepMins - b.scheduledDepMins;
+    if (a.tailId !== b.tailId) return a.tailId.localeCompare(b.tailId);
+    return a.legOrder - b.legOrder;
+  });
+
+  // Evaluate passenger connections; count each failed connection's passengers exactly once
+  const connectionResults = evaluateConnections(dataset, flightResultsById);
+  const failedConnections = connectionResults.filter((c) => c.failed);
+  const strandedPassengers = failedConnections.reduce((sum, c) => sum + c.passengers, 0);
+
+  // Evaluate crew duty durations and flag max_duty_mins violations
+  const crewResults = evaluateCrews(dataset, flightResultsById);
+  const crewViolations = crewResults.filter((c) => c.exceedsLimit);
+
+  // Compute aircraft utilisation for active fleet + spare aircraft
+  const { activeUtilisation, spareUtilisation } = computeAircraftUtilisation(
+    dataset,
+    sortedTailIds,
+    tailResultsMap
+  );
+  const aircraftUtilisation = [...activeUtilisation, ...spareUtilisation];
+
+  // Airport-level impact summary
+  const airportImpacts: AirportImpactSummary[] = dataset.airports.map((airport) => {
+    const deps = flightResults.filter((f) => f.origin === airport.id);
+    const arrs = flightResults.filter((f) => f.destination === airport.id);
+    const failedAtAirport = failedConnections.filter((c) => c.airport === airport.id);
+
+    return {
+      airportId: airport.id,
+      city: airport.city,
+      tier: airport.tier,
+      departuresCount: deps.length,
+      arrivalsCount: arrs.length,
+      delayedDepartures: deps.filter((f) => f.delayMinutes > 0).length,
+      delayedArrivals: arrs.filter((f) => f.delayMinutes > 0).length,
+      totalDepartureDelayMinutes: deps.reduce((s, f) => s + f.delayMinutes, 0),
+      failedConnectionsAtAirport: failedAtAirport.length,
+      strandedPassengersAtAirport: failedAtAirport.reduce((s, c) => s + c.passengers, 0),
+      isClosed: mergedClosuresByAirport.has(airport.id),
+    };
+  });
+
+  const kpis = computeKPIs(
+    flightResults,
+    connectionResults,
+    failedConnections,
+    strandedPassengers,
+    crewResults,
+    crewViolations,
+    activeUtilisation,
+    spareUtilisation
+  );
 
   return {
     closures: normalizedClosures,
