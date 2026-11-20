@@ -60,6 +60,7 @@ export const DELAY_REASON_LABEL: Record<DelayReason, string> = {
   ORIGIN_CLOSURE: 'Origin Closure',
   DESTINATION_CLOSURE: 'Destination Closure',
   TURNAROUND_PROPAGATION: 'Turnaround Cascade',
+  CONNECTION_HOLD: 'Connection Hold',
 };
 
 export function formatDelta(current: number, base: number, suffix = ''): string | null {
@@ -135,11 +136,14 @@ export function buildOperationalAlerts(simulationResult: SimulationResult): Oper
   const alerts: OperationalAlert[] = [];
 
   for (const c of simulationResult.closures) {
+    const windowStr = c.isOvernight
+      ? `${c.startTime}–${c.endTime} (+1d)`
+      : `${c.startTime}–${c.endTime}`;
     alerts.push({
       id: `closure-${c.id}`,
       severity: 'critical',
       category: 'AIRPORT CLOSURE',
-      message: `${c.airportId} closed ${c.startTime}–${c.endTime} IST`,
+      message: `${c.airportId} closed ${windowStr} IST`,
       detail: 'Departures and arrivals held outside closure window.',
     });
   }
@@ -204,6 +208,7 @@ export function buildDelayCauseData(simulationResult: SimulationResult): DelayCa
     ORIGIN_CLOSURE: { reason: 'Origin Closure', flights: 0, delayMins: 0 },
     DESTINATION_CLOSURE: { reason: 'Destination Closure', flights: 0, delayMins: 0 },
     TURNAROUND_PROPAGATION: { reason: 'Turnaround Cascade', flights: 0, delayMins: 0 },
+    CONNECTION_HOLD: { reason: 'Connection Hold', flights: 0, delayMins: 0 },
   };
   for (const f of simulationResult.flights) {
     if (f.delayMinutes <= 0) continue;
@@ -212,25 +217,43 @@ export function buildDelayCauseData(simulationResult: SimulationResult): DelayCa
       counts[r].delayMins += f.delayMinutes;
     }
   }
-  return Object.values(counts);
+  return Object.values(counts).filter((c) => c.flights > 0 || c.reason !== 'Connection Hold');
+}
+
+function formatHourBucketLabel(hourIndex: number): string {
+  if (hourIndex < 24) {
+    return `${String(hourIndex).padStart(2, '0')}:00`;
+  }
+  const dayOffset = Math.floor(hourIndex / 24);
+  const hourOfDay = hourIndex % 24;
+  return `${String(hourOfDay).padStart(2, '0')}:00+${dayOffset}d`;
 }
 
 export function buildHourlyDepartureProfile(
   simulationResult: SimulationResult
 ): HourlyDepartureBucket[] {
   const buckets = new Map<number, HourlyDepartureBucket>();
-  for (let h = 5; h <= 23; h++) {
-    buckets.set(h, { hour: `${String(h).padStart(2, '0')}:00`, scheduled: 0, actual: 0 });
-  }
+
+  const getOrCreate = (hourIndex: number): HourlyDepartureBucket => {
+    let bucket = buckets.get(hourIndex);
+    if (!bucket) {
+      bucket = { hour: formatHourBucketLabel(hourIndex), scheduled: 0, actual: 0 };
+      buckets.set(hourIndex, bucket);
+    }
+    return bucket;
+  };
+
   for (const f of simulationResult.flights) {
     const sh = Math.floor(f.scheduledDepMins / 60);
-    const ah = Math.min(23, Math.floor(f.actualDepMins / 60));
-    const sb = buckets.get(sh);
-    if (sb) sb.scheduled += 1;
-    const ab = buckets.get(ah);
-    if (ab) ab.actual += 1;
+    const ah = Math.floor(f.actualDepMins / 60);
+    getOrCreate(sh).scheduled += 1;
+    getOrCreate(ah).actual += 1;
   }
-  return Array.from(buckets.values()).filter((b) => b.scheduled > 0 || b.actual > 0);
+
+  return Array.from(buckets.entries())
+    .sort((a, b) => a[0] - b[0])
+    .map(([, bucket]) => bucket)
+    .filter((b) => b.scheduled > 0 || b.actual > 0);
 }
 
 export function buildFleetUtilisationData(

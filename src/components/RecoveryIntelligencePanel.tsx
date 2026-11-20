@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   AlertCircle,
   Award,
@@ -62,13 +62,19 @@ export const RecoveryIntelligencePanel: React.FC<RecoveryIntelligencePanelProps>
   }) => {
     const [showCustomBuilder, setShowCustomBuilder] = useState(false);
     const [customActionType, setCustomActionType] = useState<
-      'DEPLOY_SPARE_TAIL_SUFFIX' | 'HOLD_CONNECTING_FLIGHT'
+      'DEPLOY_SPARE_TAIL_SUFFIX' | 'SWAP_TAIL_SUFFIXES' | 'HOLD_CONNECTING_FLIGHT'
     >('DEPLOY_SPARE_TAIL_SUFFIX');
     const [customSpareId, setCustomSpareId] = useState<string>(
       dataset.spare_aircraft[0]?.tail_id ?? ''
     );
     const [customFlightId, setCustomFlightId] = useState<string>(
       dataset.flights[0]?.flight_id ?? ''
+    );
+    const [customSwapFlightAId, setCustomSwapFlightAId] = useState<string>(
+      dataset.flights[0]?.flight_id ?? ''
+    );
+    const [customSwapFlightBId, setCustomSwapFlightBId] = useState<string>(
+      dataset.flights[1]?.flight_id ?? dataset.flights[0]?.flight_id ?? ''
     );
     const [customHoldConnId, setCustomHoldConnId] = useState<string>(
       dataset.connections[0]?.connection_id ?? ''
@@ -79,6 +85,44 @@ export const RecoveryIntelligencePanel: React.FC<RecoveryIntelligencePanelProps>
       title: string;
       result: RecoveryValidationResult;
     } | null>(null);
+
+    // Keep custom selections synchronized whenever a different dataset is loaded
+    useEffect(() => {
+      setCustomSpareId(dataset.spare_aircraft[0]?.tail_id ?? '');
+      setCustomFlightId(dataset.flights[0]?.flight_id ?? '');
+      setCustomSwapFlightAId(dataset.flights[0]?.flight_id ?? '');
+      setCustomSwapFlightBId(
+        dataset.flights[1]?.flight_id ?? dataset.flights[0]?.flight_id ?? ''
+      );
+      setCustomHoldConnId(dataset.connections[0]?.connection_id ?? '');
+      setCustomValidation(null);
+    }, [dataset]);
+
+    const effectiveSpareId = dataset.spare_aircraft.some((s) => s.tail_id === customSpareId)
+      ? customSpareId
+      : (dataset.spare_aircraft[0]?.tail_id ?? '');
+
+    const effectiveFlightId = dataset.flights.some((f) => f.flight_id === customFlightId)
+      ? customFlightId
+      : (dataset.flights[0]?.flight_id ?? '');
+
+    const effectiveSwapFlightAId = dataset.flights.some(
+      (f) => f.flight_id === customSwapFlightAId
+    )
+      ? customSwapFlightAId
+      : (dataset.flights[0]?.flight_id ?? '');
+
+    const effectiveSwapFlightBId = dataset.flights.some(
+      (f) => f.flight_id === customSwapFlightBId
+    )
+      ? customSwapFlightBId
+      : (dataset.flights[1]?.flight_id ?? dataset.flights[0]?.flight_id ?? '');
+
+    const effectiveHoldConnId = dataset.connections.some(
+      (c) => c.connection_id === customHoldConnId
+    )
+      ? customHoldConnId
+      : (dataset.connections[0]?.connection_id ?? '');
 
     const inspectedStrategy = useMemo(() => {
       if (appliedStrategy) {
@@ -96,19 +140,31 @@ export const RecoveryIntelligencePanel: React.FC<RecoveryIntelligencePanelProps>
       let title = '';
 
       if (customActionType === 'DEPLOY_SPARE_TAIL_SUFFIX') {
-        const targetFlight = dataset.flights.find((f) => f.flight_id === customFlightId);
+        const targetFlight = dataset.flights.find((f) => f.flight_id === effectiveFlightId);
         action = {
           type: 'DEPLOY_SPARE_TAIL_SUFFIX',
-          spareTailId: customSpareId,
+          spareTailId: effectiveSpareId,
           targetTailId: targetFlight?.tail_id ?? '',
-          fromFlightId: customFlightId,
+          fromFlightId: effectiveFlightId,
         };
-        title = `Custom Spare: ${customSpareId} → ${customFlightId}+`;
+        title = `Custom Spare: ${effectiveSpareId} → ${effectiveFlightId}+`;
+      } else if (customActionType === 'SWAP_TAIL_SUFFIXES') {
+        const flightA = dataset.flights.find((f) => f.flight_id === effectiveSwapFlightAId);
+        const flightB = dataset.flights.find((f) => f.flight_id === effectiveSwapFlightBId);
+        action = {
+          type: 'SWAP_TAIL_SUFFIXES',
+          tailAId: flightA?.tail_id ?? '',
+          fromFlightAId: effectiveSwapFlightAId,
+          tailBId: flightB?.tail_id ?? '',
+          fromFlightBId: effectiveSwapFlightBId,
+          hubAirportId: flightA?.origin ?? '',
+        };
+        title = `Custom Swap: ${flightA?.tail_id ?? ''} (${effectiveSwapFlightAId}+) ↔ ${flightB?.tail_id ?? ''} (${effectiveSwapFlightBId}+)`;
       } else {
-        const conn = dataset.connections.find((c) => c.connection_id === customHoldConnId);
+        const conn = dataset.connections.find((c) => c.connection_id === effectiveHoldConnId);
         action = {
           type: 'HOLD_CONNECTING_FLIGHT',
-          connectionId: customHoldConnId,
+          connectionId: effectiveHoldConnId,
           flightId: conn?.to_flight ?? '',
           holdMinutes: Math.trunc(customHoldMinutes),
         };
@@ -199,13 +255,17 @@ export const RecoveryIntelligencePanel: React.FC<RecoveryIntelligencePanelProps>
                   value={customActionType}
                   onChange={(e) => {
                     setCustomActionType(
-                      e.target.value as 'DEPLOY_SPARE_TAIL_SUFFIX' | 'HOLD_CONNECTING_FLIGHT'
+                      e.target.value as
+                        | 'DEPLOY_SPARE_TAIL_SUFFIX'
+                        | 'SWAP_TAIL_SUFFIXES'
+                        | 'HOLD_CONNECTING_FLIGHT'
                     );
                     setCustomValidation(null);
                   }}
                   className="w-full h-8 bg-white border border-[#DCE2E8] rounded px-2 text-xs text-[#253342] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
                 >
                   <option value="DEPLOY_SPARE_TAIL_SUFFIX">Deploy Standby Spare</option>
+                  <option value="SWAP_TAIL_SUFFIXES">Swap Tail Rotations</option>
                   <option value="HOLD_CONNECTING_FLIGHT">Hold Connecting Flight</option>
                 </select>
               </div>
@@ -221,18 +281,23 @@ export const RecoveryIntelligencePanel: React.FC<RecoveryIntelligencePanelProps>
                     </label>
                     <select
                       id="custom-spare-tail"
-                      value={customSpareId}
+                      value={effectiveSpareId}
+                      disabled={dataset.spare_aircraft.length === 0}
                       onChange={(e) => {
                         setCustomSpareId(e.target.value);
                         setCustomValidation(null);
                       }}
-                      className="w-full h-8 bg-white border border-[#DCE2E8] rounded px-2 text-xs text-[#253342] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
+                      className="w-full h-8 bg-white border border-[#DCE2E8] rounded px-2 text-xs text-[#253342] disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
                     >
-                      {dataset.spare_aircraft.map((sp) => (
-                        <option key={sp.tail_id} value={sp.tail_id}>
-                          {sp.tail_id} (Base {sp.base}, avail {sp.available_from})
-                        </option>
-                      ))}
+                      {dataset.spare_aircraft.length === 0 ? (
+                        <option value="">No spare aircraft in dataset</option>
+                      ) : (
+                        dataset.spare_aircraft.map((sp) => (
+                          <option key={sp.tail_id} value={sp.tail_id}>
+                            {sp.tail_id} (Base {sp.base}, avail {sp.available_from})
+                          </option>
+                        ))
+                      )}
                     </select>
                   </div>
 
@@ -245,9 +310,59 @@ export const RecoveryIntelligencePanel: React.FC<RecoveryIntelligencePanelProps>
                     </label>
                     <select
                       id="custom-target-flight"
-                      value={customFlightId}
+                      value={effectiveFlightId}
                       onChange={(e) => {
                         setCustomFlightId(e.target.value);
+                        setCustomValidation(null);
+                      }}
+                      className="w-full h-8 bg-white border border-[#DCE2E8] rounded px-2 text-xs text-[#253342] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
+                    >
+                      {dataset.flights.map((f) => (
+                        <option key={f.flight_id} value={f.flight_id}>
+                          {f.flight_id} ({f.tail_id} · {f.origin}→{f.destination} {f.dep})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </>
+              ) : customActionType === 'SWAP_TAIL_SUFFIXES' ? (
+                <>
+                  <div className="sm:col-span-3">
+                    <label
+                      htmlFor="custom-swap-flight-a"
+                      className="block text-[11px] font-medium text-[#596775] mb-1"
+                    >
+                      Delayed Rotation From
+                    </label>
+                    <select
+                      id="custom-swap-flight-a"
+                      value={effectiveSwapFlightAId}
+                      onChange={(e) => {
+                        setCustomSwapFlightAId(e.target.value);
+                        setCustomValidation(null);
+                      }}
+                      className="w-full h-8 bg-white border border-[#DCE2E8] rounded px-2 text-xs text-[#253342] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
+                    >
+                      {dataset.flights.map((f) => (
+                        <option key={f.flight_id} value={f.flight_id}>
+                          {f.flight_id} ({f.tail_id} · {f.origin}→{f.destination} {f.dep})
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="sm:col-span-4">
+                    <label
+                      htmlFor="custom-swap-flight-b"
+                      className="block text-[11px] font-medium text-[#596775] mb-1"
+                    >
+                      Swap Partner Rotation From
+                    </label>
+                    <select
+                      id="custom-swap-flight-b"
+                      value={effectiveSwapFlightBId}
+                      onChange={(e) => {
+                        setCustomSwapFlightBId(e.target.value);
                         setCustomValidation(null);
                       }}
                       className="w-full h-8 bg-white border border-[#DCE2E8] rounded px-2 text-xs text-[#253342] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
@@ -271,19 +386,24 @@ export const RecoveryIntelligencePanel: React.FC<RecoveryIntelligencePanelProps>
                     </label>
                     <select
                       id="custom-hold-conn"
-                      value={customHoldConnId}
+                      value={effectiveHoldConnId}
+                      disabled={dataset.connections.length === 0}
                       onChange={(e) => {
                         setCustomHoldConnId(e.target.value);
                         setCustomValidation(null);
                       }}
-                      className="w-full h-8 bg-white border border-[#DCE2E8] rounded px-2 text-xs text-[#253342] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
+                      className="w-full h-8 bg-white border border-[#DCE2E8] rounded px-2 text-xs text-[#253342] disabled:opacity-60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
                     >
-                      {dataset.connections.map((c) => (
-                        <option key={c.connection_id} value={c.connection_id}>
-                          {c.connection_id} ({c.airport}: {c.from_flight}→{c.to_flight},{' '}
-                          {c.passengers} pax)
-                        </option>
-                      ))}
+                      {dataset.connections.length === 0 ? (
+                        <option value="">No connections in dataset</option>
+                      ) : (
+                        dataset.connections.map((c) => (
+                          <option key={c.connection_id} value={c.connection_id}>
+                            {c.connection_id} ({c.airport}: {c.from_flight}→{c.to_flight},{' '}
+                            {c.passengers} pax)
+                          </option>
+                        ))
+                      )}
                     </select>
                   </div>
 

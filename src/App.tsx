@@ -17,7 +17,8 @@ import {
   X,
 } from 'lucide-react';
 import { AnalyticsView } from './components/AnalyticsView';
-import { ClosureControlsPanel } from './components/ClosureControlsPanel';
+import { validateClosureWindow } from './closureUtils';
+import { ClosureControlsPanel, type UpdateClosureResult } from './components/ClosureControlsPanel';
 import { DominoRecoveryView } from './components/DominoRecoveryView';
 import { FlightOperationsTable } from './components/FlightOperationsTable';
 import { IndiaNetworkMap } from './components/IndiaNetworkMap';
@@ -41,7 +42,6 @@ import {
   type SortDirection,
   type SortField,
 } from './simulationViewModels';
-import { parseClosureTimeToMinutes } from './timeUtils';
 import type {
   AirportClosureInput,
   FlightNetworkDataset,
@@ -112,6 +112,7 @@ export function App() {
   }, []);
 
   const [dataset, setDataset] = useState<FlightNetworkDataset | null>(initialLoad.dataset);
+  const [datasetVersion, setDatasetVersion] = useState<number>(0);
   const [loadError, setLoadError] = useState<string | null>(initialLoad.error);
 
   const [activeNav, setActiveNav] = useState<NavSection>('overview');
@@ -120,7 +121,9 @@ export function App() {
 
   const [stagedClosures, setStagedClosures] = useState<AirportClosureInput[]>([]);
   const [committedClosures, setCommittedClosures] = useState<AirportClosureInput[]>([]);
-  const [formAirport, setFormAirport] = useState<string>('BOM');
+  const [formAirport, setFormAirport] = useState<string>(
+    () => initialLoad.dataset?.airports[0]?.id ?? ''
+  );
   const [formStart, setFormStart] = useState<string>('08:00');
   const [formEnd, setFormEnd] = useState<string>('10:00');
   const [closureError, setClosureError] = useState<string | null>(null);
@@ -164,53 +167,113 @@ export function App() {
     setMobileNavOpen(false);
   }, []);
 
+  const handleFormAirportChange = useCallback((value: string) => {
+    setFormAirport(value);
+    setClosureError(null);
+  }, []);
+
+  const handleFormStartChange = useCallback((value: string) => {
+    setFormStart(value);
+    setClosureError(null);
+  }, []);
+
+  const handleFormEndChange = useCallback((value: string) => {
+    setFormEnd(value);
+    setClosureError(null);
+  }, []);
+
+  const stageValidatedClosure = useCallback(
+    (airportId: string, startTime: string, endTime: string): boolean => {
+      if (!dataset) return false;
+      const validAirportIds = new Set(dataset.airports.map((a) => a.id));
+      const check = validateClosureWindow(
+        { airportId, startTime, endTime },
+        validAirportIds,
+        stagedClosures
+      );
+      if (!check.valid) {
+        setClosureError(check.error);
+        return false;
+      }
+
+      const next: AirportClosureInput = {
+        id: `${check.normalized.airportId}-${check.normalized.startTime}-${check.normalized.endTime}-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        airportId: check.normalized.airportId,
+        startTime: check.normalized.startTime,
+        endTime: check.normalized.endTime,
+      };
+      setClosureError(null);
+      setStagedClosures((prev) => [...prev, next]);
+      setStatusAnnouncement(
+        `Staged closure for ${next.airportId} from ${next.startTime} to ${next.endTime}${
+          check.normalized.isOvernight ? ' (+1d)' : ''
+        } IST. Run simulation to apply.`
+      );
+      return true;
+    },
+    [dataset, stagedClosures]
+  );
+
   const handleAddClosure = useCallback(
     (e: React.FormEvent) => {
       e.preventDefault();
-      setClosureError(null);
-      if (!dataset) return;
-
-      try {
-        const airportExists = dataset.airports.some((a) => a.id === formAirport);
-        if (!airportExists) {
-          setClosureError(`Unknown airport station "${formAirport}".`);
-          return;
-        }
-        const startMins = parseClosureTimeToMinutes(formStart);
-        const endMins = parseClosureTimeToMinutes(formEnd);
-        if (endMins <= startMins) {
-          setClosureError('Closure end time must be strictly after start time.');
-          return;
-        }
-        const duplicate = stagedClosures.some(
-          (c) =>
-            c.airportId === formAirport && c.startTime === formStart && c.endTime === formEnd
-        );
-        if (duplicate) {
-          setClosureError(
-            `Closure ${formAirport} ${formStart}–${formEnd} is already staged.`
-          );
-          return;
-        }
-
-        const next: AirportClosureInput = {
-          id: `${formAirport}-${formStart}-${formEnd}-${Date.now()}`,
-          airportId: formAirport,
-          startTime: formStart,
-          endTime: formEnd,
-        };
-        setStagedClosures((prev) => [...prev, next]);
-        setStatusAnnouncement(
-          `Staged closure for ${formAirport} from ${formStart} to ${formEnd} IST. Run simulation to apply.`
-        );
-      } catch (err) {
-        setClosureError(err instanceof Error ? err.message : 'Invalid time input.');
-      }
+      stageValidatedClosure(formAirport, formStart, formEnd);
     },
-    [dataset, formAirport, formStart, formEnd, stagedClosures]
+    [stageValidatedClosure, formAirport, formStart, formEnd]
+  );
+
+  const handleStagePresetClosure = useCallback(
+    (airportId: string, startTime: string, endTime: string) => {
+      setFormAirport(airportId);
+      setFormStart(startTime);
+      setFormEnd(endTime);
+      stageValidatedClosure(airportId, startTime, endTime);
+    },
+    [stageValidatedClosure]
+  );
+
+  const handleUpdateClosure = useCallback(
+    (
+      id: string,
+      nextAirport: string,
+      nextStart: string,
+      nextEnd: string
+    ): UpdateClosureResult => {
+      if (!dataset) return { ok: false, error: 'Dataset is not loaded.' };
+      const validAirportIds = new Set(dataset.airports.map((a) => a.id));
+      const check = validateClosureWindow(
+        { airportId: nextAirport, startTime: nextStart, endTime: nextEnd },
+        validAirportIds,
+        stagedClosures,
+        id
+      );
+      if (!check.valid) {
+        return { ok: false, error: check.error };
+      }
+
+      setClosureError(null);
+      setStagedClosures((prev) =>
+        prev.map((c) =>
+          c.id === id
+            ? {
+                ...c,
+                airportId: check.normalized.airportId,
+                startTime: check.normalized.startTime,
+                endTime: check.normalized.endTime,
+              }
+            : c
+        )
+      );
+      setStatusAnnouncement(
+        `Updated closure for ${check.normalized.airportId} to ${check.normalized.startTime}–${check.normalized.endTime} IST. Run simulation to apply.`
+      );
+      return { ok: true };
+    },
+    [dataset, stagedClosures]
   );
 
   const handleRemoveClosure = useCallback((id: string) => {
+    setClosureError(null);
     setStagedClosures((prev) => {
       const target = prev.find((c) => c.id === id);
       if (target) {
@@ -307,7 +370,11 @@ export function App() {
         id: `custom-${Date.now()}`,
         title,
         category:
-          actions[0]?.type === 'HOLD_CONNECTING_FLIGHT' ? 'CONNECTION_HOLD' : 'SPARE_AIRCRAFT',
+          actions[0]?.type === 'HOLD_CONNECTING_FLIGHT'
+            ? 'CONNECTION_HOLD'
+            : actions[0]?.type === 'SWAP_TAIL_SUFFIXES'
+              ? 'TAIL_SWAP'
+              : 'SPARE_AIRCRAFT',
         summary: title,
         rationale: 'Operator-validated recovery action.',
         actions,
@@ -345,6 +412,7 @@ export function App() {
       const parsed = JSON.parse(text);
       const validated = validateFlightNetworkDataset(parsed);
       setDataset(validated);
+      setDatasetVersion((v) => v + 1);
       setLoadError(null);
       setClosureError(null);
       setStagedClosures([]);
@@ -353,6 +421,7 @@ export function App() {
       setSelectedPreviewId(null);
       setSelectedAirportId(null);
       setAirportFilter('ALL');
+      setSearchQuery('');
       if (validated.airports.length > 0) {
         setFormAirport(validated.airports[0].id);
       }
@@ -705,10 +774,12 @@ export function App() {
                     hasPendingChanges={hasPendingChanges}
                     closureError={closureError}
                     compact
-                    onFormAirportChange={setFormAirport}
-                    onFormStartChange={setFormStart}
-                    onFormEndChange={setFormEnd}
+                    onFormAirportChange={handleFormAirportChange}
+                    onFormStartChange={handleFormStartChange}
+                    onFormEndChange={handleFormEndChange}
                     onAddClosure={handleAddClosure}
+                    onStagePresetClosure={handleStagePresetClosure}
+                    onUpdateClosure={handleUpdateClosure}
                     onRemoveClosure={handleRemoveClosure}
                     onRunSimulation={handleRunSimulation}
                     onResetToBaseline={handleResetToBaseline}
@@ -785,10 +856,12 @@ export function App() {
                     committedClosures={committedClosures}
                     hasPendingChanges={hasPendingChanges}
                     closureError={closureError}
-                    onFormAirportChange={setFormAirport}
-                    onFormStartChange={setFormStart}
-                    onFormEndChange={setFormEnd}
+                    onFormAirportChange={handleFormAirportChange}
+                    onFormStartChange={handleFormStartChange}
+                    onFormEndChange={handleFormEndChange}
                     onAddClosure={handleAddClosure}
+                    onStagePresetClosure={handleStagePresetClosure}
+                    onUpdateClosure={handleUpdateClosure}
                     onRemoveClosure={handleRemoveClosure}
                     onRunSimulation={handleRunSimulation}
                     onResetToBaseline={handleResetToBaseline}
@@ -826,6 +899,7 @@ export function App() {
           {/* VIEW 4.5: DOMINO EFFECT & RECOVERY INTELLIGENCE */}
           {activeNav === 'domino' && (
             <DominoRecoveryView
+              key={`domino-${datasetVersion}`}
               dataset={dataset}
               closures={committedClosures}
               baselineResult={baselineResult}

@@ -295,7 +295,7 @@ export const IndiaNetworkMap: React.FC<IndiaNetworkMapProps> = React.memo(
             viewBox={`0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}`}
             className="w-full h-full max-h-[540px] select-none"
             role="img"
-            aria-label="India airline route network map showing 16 stations and flight corridors"
+            aria-label={`India airline route network map showing ${airports.length} station${airports.length === 1 ? '' : 's'} and ${routes.length} flight corridor${routes.length === 1 ? '' : 's'}`}
           >
             {/* Lat/Lng Graticule */}
             <g stroke="#D6DFE7" strokeWidth="0.8">

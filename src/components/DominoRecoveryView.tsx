@@ -2,6 +2,7 @@ import React, { useMemo } from 'react';
 import { BeforeAfterComparisonPanel } from './BeforeAfterComparisonPanel';
 import { DominoTimelinePanel } from './DominoTimelinePanel';
 import { RecoveryIntelligencePanel } from './RecoveryIntelligencePanel';
+import { formatClosureWindowLabel, getAvailableClosurePresets } from '../closureUtils';
 import { buildDominoTimeline } from '../recoveryEngine';
 import type {
   AirportClosureInput,
@@ -63,6 +64,11 @@ export const DominoRecoveryView: React.FC<DominoRecoveryViewProps> = React.memo(
       [disruptedResult, baselineResult, appliedStrategy, activeResult]
     );
 
+    const availablePresets = useMemo(
+      () => getAvailableClosurePresets(dataset.airports),
+      [dataset.airports]
+    );
+
     const previewStrategy = useMemo(() => {
       if (appliedStrategy) return null;
       if (selectedPreviewId) {
@@ -84,34 +90,38 @@ export const DominoRecoveryView: React.FC<DominoRecoveryViewProps> = React.memo(
           <div className="flex flex-wrap items-center gap-2">
             <span className="font-semibold text-[#253342]">Active Scenario:</span>
             <span className="font-mono text-[#596775]">
-              {closures.length === 0
+              {disruptedResult.closures.length === 0
                 ? 'Baseline Schedule (0 closures)'
-                : closures.map((c) => `${c.airportId} ${c.startTime}–${c.endTime}`).join(' · ')}
+                : disruptedResult.closures
+                    .map((c) => `${c.airportId} ${formatClosureWindowLabel(c)}`)
+                    .join(' · ')}
             </span>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
-            <span className="text-[11px] text-[#596775]">Quick Scenarios:</span>
+            {availablePresets.length > 0 && (
+              <>
+                <span className="text-[11px] text-[#596775]">Quick Scenarios:</span>
+                {availablePresets.map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    onClick={() =>
+                      onTriggerPresetScenario(preset.airportId, preset.startTime, preset.endTime)
+                    }
+                    className="h-7 px-2.5 rounded bg-[#F3F5F7] hover:bg-[#E7ECF0] border border-[#DCE2E8] text-[11px] font-medium text-[#253342] cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
+                  >
+                    {preset.label} ({preset.startTime}–{preset.endTime})
+                  </button>
+                ))}
+              </>
+            )}
             <button
               type="button"
-              onClick={() => onTriggerPresetScenario('BOM', '07:30', '09:30')}
-              className="h-7 px-2.5 rounded bg-[#F3F5F7] hover:bg-[#E7ECF0] border border-[#DCE2E8] text-[11px] font-medium text-[#253342] cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
+              onClick={onOpenSimulator}
+              className="h-7 px-2.5 rounded bg-white hover:bg-[#F3F5F7] border border-[#DCE2E8] text-[11px] font-medium text-[#477F7A] cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
             >
-              BOM Morning (07:30–09:30)
-            </button>
-            <button
-              type="button"
-              onClick={() => onTriggerPresetScenario('DEL', '08:00', '10:00')}
-              className="h-7 px-2.5 rounded bg-[#F3F5F7] hover:bg-[#E7ECF0] border border-[#DCE2E8] text-[11px] font-medium text-[#253342] cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
-            >
-              DEL Peak (08:00–10:00)
-            </button>
-            <button
-              type="button"
-              onClick={() => onTriggerPresetScenario('AMD', '06:00', '08:00')}
-              className="h-7 px-2.5 rounded bg-[#F3F5F7] hover:bg-[#E7ECF0] border border-[#DCE2E8] text-[11px] font-medium text-[#253342] cursor-pointer focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
-            >
-              AMD Hub (06:00–08:00)
+              Custom Closures
             </button>
           </div>
         </div>
@@ -120,6 +130,7 @@ export const DominoRecoveryView: React.FC<DominoRecoveryViewProps> = React.memo(
         <DominoTimelinePanel
           events={timelineEvents}
           hasClosures={closures.length > 0}
+          presets={availablePresets}
           onTriggerPresetScenario={onTriggerPresetScenario}
           onOpenSimulator={onOpenSimulator}
         />

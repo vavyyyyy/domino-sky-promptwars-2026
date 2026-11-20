@@ -7,6 +7,7 @@ import type {
   ConstraintCheckItem,
   DeploySpareTailAction,
   DominoTimelineEvent,
+  FlightHoldConstraint,
   FlightNetworkDataset,
   FlightSimulationResult,
   HoldConnectingFlightAction,
@@ -60,18 +61,19 @@ export function buildDominoTimeline(
     if (!closureEventIdByAirport.has(closure.airportId)) {
       closureEventIdByAirport.set(closure.airportId, id);
     }
+    const endLabel = closure.isOvernight ? `${closure.endTime}+1d` : closure.endTime;
     events.push({
       id,
       sequence: 0,
       timeMins: closure.startMins,
       timeLabel: closure.startTime,
       endTimeMins: closure.endMins,
-      endTimeLabel: closure.endTime,
+      endTimeLabel: endLabel,
       type: 'DISRUPTION_ORIGIN',
       stageKind: 'ORIGINAL_EVENT',
       severity: 'critical',
-      title: `${closure.airportId} Airfield Closure (${closure.startTime}–${closure.endTime} IST)`,
-      description: `All departures and arrivals suspended at ${closure.airportId} during [${closure.startTime}, ${closure.endTime}).`,
+      title: `${closure.airportId} Airfield Closure (${closure.startTime}–${endLabel} IST)`,
+      description: `All departures and arrivals suspended at ${closure.airportId} during [${closure.startTime}, ${endLabel}).`,
       airportId: closure.airportId,
     });
   }
@@ -247,7 +249,7 @@ export function buildDominoTimeline(
         });
       } else if (action.type === 'HOLD_CONNECTING_FLIGHT') {
         const recF = recoveredById.get(action.flightId);
-        const execMins = recF ? recF.scheduledDepMins - action.holdMinutes : 0;
+        const execMins = recF ? recF.scheduledDepMins : 0;
         events.push({
           id: `evt-rec-${idx}-${action.flightId}`,
           sequence: 0,
@@ -328,7 +330,8 @@ function renumberTailLegs(flights: RawFlight[]): void {
 
 function applySingleAction(
   dataset: FlightNetworkDataset,
-  action: RecoveryAction
+  action: RecoveryAction,
+  flightHoldMap: Map<string, { holdMinutes: number; connectionIds: string[] }>
 ): { reassignedCount: number; rescheduledCount: number; touchedCrews: Set<string>; touchedTails: Set<string> } {
   const touchedCrews = new Set<string>();
   const touchedTails = new Set<string>();
@@ -495,7 +498,7 @@ function applySingleAction(
     };
   }
 
-  // HOLD_CONNECTING_FLIGHT
+  // HOLD_CONNECTING_FLIGHT: track as separate operational earliest-release constraint (STD/STA remain immutable)
   if (!Number.isInteger(action.holdMinutes) || action.holdMinutes <= 0 || action.holdMinutes > 180) {
     throw new Error('Hold duration must be a positive integer between 1 and 180 minutes.');
   }
@@ -505,17 +508,20 @@ function applySingleAction(
     throw new Error(`Flight "${action.flightId}" not found.`);
   }
 
-  const newDepMins = parseTimeToMinutes(flight.dep) + action.holdMinutes;
-  const newArrMins = parseTimeToMinutes(flight.arr) + action.holdMinutes;
-  if (newArrMins >= 1440) {
+  const existingHold = flightHoldMap.get(flight.flight_id);
+  const totalHoldMinutes = (existingHold?.holdMinutes ?? 0) + action.holdMinutes;
+  const heldArrMins = parseTimeToMinutes(flight.arr) + totalHoldMinutes;
+  if (heldArrMins >= 1440) {
     throw new Error(
-      `Holding ${flight.flight_id} by ${action.holdMinutes}m pushes scheduled arrival past 23:59 operating day.`
+      `Holding ${flight.flight_id} by ${totalHoldMinutes}m pushes operational release arrival past 23:59 operating day.`
     );
   }
 
-  flight.dep = formatMinutesToTime(newDepMins);
-  flight.arr = formatMinutesToTime(newArrMins);
-  renumberTailLegs(dataset.flights);
+  const connectionIds = existingHold ? [...existingHold.connectionIds] : [];
+  if (action.connectionId && !connectionIds.includes(action.connectionId)) {
+    connectionIds.push(action.connectionId);
+  }
+  flightHoldMap.set(flight.flight_id, { holdMinutes: totalHoldMinutes, connectionIds });
 
   touchedTails.add(flight.tail_id);
   for (const crew of dataset.crews) {
@@ -561,12 +567,13 @@ export function validateRecoveryActions(
   const reasons: string[] = [];
   const touchedCrews = new Set<string>();
   const touchedTails = new Set<string>();
+  const flightHoldMap = new Map<string, { holdMinutes: number; connectionIds: string[] }>();
   let reassignedFlightsCount = 0;
   let rescheduledFlightsCount = 0;
 
   try {
     for (const action of actions) {
-      const outcome = applySingleAction(candidateDataset, action);
+      const outcome = applySingleAction(candidateDataset, action, flightHoldMap);
       reassignedFlightsCount += outcome.reassignedCount;
       rescheduledFlightsCount += outcome.rescheduledCount;
       outcome.touchedCrews.forEach((c) => touchedCrews.add(c));
@@ -612,9 +619,21 @@ export function validateRecoveryActions(
     };
   }
 
+  const flightHolds: FlightHoldConstraint[] = Array.from(flightHoldMap.entries()).map(
+    ([flightId, entry]) => ({
+      flightId,
+      holdMinutes: entry.holdMinutes,
+      connectionId: entry.connectionIds.join(', '),
+    })
+  );
+
   let simResult: SimulationResult;
   try {
-    simResult = runSimulation(validatedDataset, closures);
+    simResult = runSimulation(
+      validatedDataset,
+      closures,
+      flightHolds.length > 0 ? { flightHolds } : undefined
+    );
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Simulation failed on recovered schedule.';
     return {
@@ -775,14 +794,14 @@ export function computeBeforeAfterComparison(
 
 /**
  * Transparent, deterministic Recovery Scorecard (0 - 100):
- * - Delay Reduction (0-30): 30 * clamp(delaySaved / disruptedTotalDelay, 0, 1)
- * - Passenger Protection (0-30):
- *     If strandedPassengers > 0: 30 * clamp(strandedSaved / disruptedStranded, 0, 1)
- *     Else: 30 * clamp(delayedPaxSaved / max(1, disruptedDelayedPax), 0, 1)
- * - Crew Legality (0-20): 20 if 0 violations (minus 1 pt per watch crew <20m margin, max 4),
- *     or reduced proportionally if unrelated violations remain.
- * - Aircraft Feasibility (0-10): 10 for verified continuity + turnaround >= min + balanced utilisation
- * - Operational Simplicity (0-10): 10 - (actionsCount - 1) * 2 - min(4, (reassigned + rescheduled) * 0.4)
+ * - Delay Reduction (0-30): 20 * delayMinsRatio + 10 * flightsRecoveredRatio
+ * - Passenger Protection (0-30): Unified weighted passenger-burden reduction
+ *     (strandedPassengers * 10 + delayedPassengers) across both stranded and delayed pax
+ * - Crew Legality (0-20): Full 20 for zero violations & zero recovery-induced <=20m buffers;
+ *     strict deductions (no floor) for unresolved crew duty violations or overtime
+ * - Aircraft Feasibility (0-10): Deducts 0.5 only for recovery-induced <=30m tight turnarounds
+ *     (unchanged pre-existing constraints are not penalized)
+ * - Operational Simplicity (0-10): 10 - (actionsCount - 1) * 1.0 - min(2, touchedLegs * 0.2)
  */
 export function computeRecoveryScorecard(
   disruptedResult: SimulationResult,
@@ -810,36 +829,59 @@ export function computeRecoveryScorecard(
     delayReductionScore = 30;
   }
 
+  // Unified weighted passenger protection curve (stranded = 10x, delayed = 1x)
+  const STRANDED_WEIGHT = 10;
+  const disruptedWeightedPax = dk.strandedPassengers * STRANDED_WEIGHT + dk.delayedPassengers;
+  const recoveredWeightedPax = rk.strandedPassengers * STRANDED_WEIGHT + rk.delayedPassengers;
   let passengerProtectionScore = 0;
-  if (dk.strandedPassengers > 0) {
-    const paxRatio = Math.max(
+  if (disruptedWeightedPax > 0) {
+    const burdenRatio = Math.max(
       0,
-      Math.min(1, comparison.deltas.strandedPassengersSaved / dk.strandedPassengers)
+      Math.min(1, (disruptedWeightedPax - recoveredWeightedPax) / disruptedWeightedPax)
     );
-    passengerProtectionScore = round1(paxRatio * 30);
-  } else if (dk.delayedPassengers > 0) {
-    const delayedPaxSaved = Math.max(0, dk.delayedPassengers - rk.delayedPassengers);
-    passengerProtectionScore = round1(Math.min(1, delayedPaxSaved / dk.delayedPassengers) * 30);
+    passengerProtectionScore = round1(burdenRatio * 30);
   } else {
-    passengerProtectionScore = 30;
+    passengerProtectionScore = recoveredWeightedPax > 0 ? 0 : 30;
   }
 
+  // Crew legality: strict unresolved penalties; zero penalty for unchanged pre-existing buffers
+  const disruptedCrewMap = new Map(disruptedResult.crews.map((c) => [c.crewId, c]));
   let crewLegalityScore = 20;
+  let inducedWatchCrews = 0;
   if (rk.crewViolationsCount > 0) {
-    const unresolvedPenalty = Math.min(16, rk.crewViolationsCount * 8);
-    crewLegalityScore = round1(Math.max(0, 20 - unresolvedPenalty));
+    const countPenalty = rk.crewViolationsCount * 10;
+    const overtimePenalty = Math.min(8, rk.totalCrewOvertimeMinutes / 10);
+    crewLegalityScore = round1(Math.max(0, 20 - countPenalty - overtimePenalty));
   } else {
-    const watchCrews = recoveredResult.crews.filter(
-      (c) => !c.exceedsLimit && c.maxDutyMins - c.actualDutyMins <= 20
-    ).length;
-    crewLegalityScore = round1(Math.max(14, 20 - watchCrews));
+    inducedWatchCrews = recoveredResult.crews.filter((c) => {
+      if (c.exceedsLimit || c.maxDutyMins - c.actualDutyMins > 20) return false;
+      const prev = disruptedCrewMap.get(c.crewId);
+      if (!prev) return true;
+      const prevMargin = prev.maxDutyMins - prev.actualDutyMins;
+      const curMargin = c.maxDutyMins - c.actualDutyMins;
+      const rosterChanged =
+        prev.flightIds.length !== c.flightIds.length ||
+        prev.flightIds.some((fid, idx) => fid !== c.flightIds[idx]);
+      return curMargin < prevMargin || rosterChanged;
+    }).length;
+    crewLegalityScore = round1(Math.max(16, 20 - inducedWatchCrews));
   }
 
-  // Aircraft feasibility: valid continuity + turnaround >= 30m guaranteed by validator (8 base + 2 for turnaround cushion)
-  const tightTurnarounds = recoveredResult.flights.filter(
-    (f) => f.turnaroundBeforeActualMins !== null && f.turnaroundBeforeActualMins === 30
-  ).length;
-  const aircraftFeasibilityScore = round1(Math.max(7, 10 - tightTurnarounds * 0.5));
+  // Aircraft feasibility: penalize only recovery-induced tight (<=30m) turnarounds
+  const disruptedFlightMap = new Map(disruptedResult.flights.map((f) => [f.flightId, f]));
+  const inducedTightTurnarounds = recoveredResult.flights.filter((rf) => {
+    if (rf.turnaroundBeforeActualMins === null || rf.turnaroundBeforeActualMins > 30) {
+      return false;
+    }
+    const df = disruptedFlightMap.get(rf.flightId);
+    if (!df) return true;
+    const unchangedPreExisting =
+      df.tailId === rf.tailId &&
+      df.actualDepMins === rf.actualDepMins &&
+      df.turnaroundBeforeActualMins === rf.turnaroundBeforeActualMins;
+    return !unchangedPreExisting;
+  }).length;
+  const aircraftFeasibilityScore = round1(Math.max(6, 10 - inducedTightTurnarounds * 0.5));
 
   const totalTouchedLegs = reassignedFlightsCount + rescheduledFlightsCount;
   const simplicityRaw = 10 - (actionsCount - 1) * 1.0 - Math.min(2, totalTouchedLegs * 0.2);
@@ -855,11 +897,11 @@ export function computeRecoveryScorecard(
 
   const formulaNotes = [
     `Delay Reduction (${delayReductionScore}/30): 20 × (${comparison.deltas.delayMinutesSaved}m saved / ${dk.totalDelayMinutes}m) + 10 × (${comparison.deltas.flightsRecoveredCount} recovered / ${dk.delayedFlights} delayed).`,
-    dk.strandedPassengers > 0
-      ? `Passenger Protection (${passengerProtectionScore}/30): 30 × (${comparison.deltas.strandedPassengersSaved} pax rescued / ${dk.strandedPassengers} stranded).`
-      : `Passenger Protection (${passengerProtectionScore}/30): Scaled by delayed passenger exposure reduction (${dk.delayedPassengers} → ${rk.delayedPassengers}).`,
-    `Crew Legality (${crewLegalityScore}/20): Full 20 pts for zero violations; penalized for unresolved overtime or <=20m duty buffer.`,
-    `Aircraft Feasibility (${aircraftFeasibilityScore}/10): Rotation continuity & >=30m turnarounds verified (${tightTurnarounds} tight 30m turnarounds).`,
+    `Passenger Protection (${passengerProtectionScore}/30): Unified burden reduction (${dk.strandedPassengers} stranded×10 + ${dk.delayedPassengers} delayed → ${rk.strandedPassengers} stranded×10 + ${rk.delayedPassengers} delayed).`,
+    rk.crewViolationsCount > 0
+      ? `Crew Legality (${crewLegalityScore}/20): Penalized for ${rk.crewViolationsCount} unresolved crew violation(s) and +${rk.totalCrewOvertimeMinutes}m overtime.`
+      : `Crew Legality (${crewLegalityScore}/20): Zero violations (${inducedWatchCrews} recovery-induced <=20m duty margin${inducedWatchCrews === 1 ? '' : 's'}).`,
+    `Aircraft Feasibility (${aircraftFeasibilityScore}/10): Rotation continuity & >=30m turnarounds verified (${inducedTightTurnarounds} recovery-induced <=30m turnaround${inducedTightTurnarounds === 1 ? '' : 's'}).`,
     `Operational Simplicity (${operationalSimplicityScore}/10): Weighs action count (${actionsCount}) and touched legs (${totalTouchedLegs}).`,
   ];
 
@@ -1014,26 +1056,30 @@ export function evaluateRecoveryStrategies(
     }
   }
 
-  // 3. Connection Protection Holds (reschedule outbound leg to save high-impact missed connections)
+  // 3. Connection Protection Holds (earliest-release hold beyond STD to save high-impact missed connections)
   const sortedFailedConns = [...disruptedResult.failedConnections].sort(
     (a, b) => b.passengers - a.passengers || a.shortfallMinutes - b.shortfallMinutes
   );
 
   const holdActions: HoldConnectingFlightAction[] = [];
   for (const conn of sortedFailedConns.slice(0, 5)) {
-    if (conn.shortfallMinutes <= 0 || conn.shortfallMinutes > 90) continue;
+    const toFlight = disruptedResult.flights.find((f) => f.flightId === conn.toFlightId);
+    const requiredHoldMinutes = (toFlight ? toFlight.delayMinutes : 0) + conn.shortfallMinutes;
+    if (conn.shortfallMinutes <= 0 || requiredHoldMinutes <= 0 || requiredHoldMinutes > 120) {
+      continue;
+    }
     const action: HoldConnectingFlightAction = {
       type: 'HOLD_CONNECTING_FLIGHT',
       connectionId: conn.connectionId,
       flightId: conn.toFlightId,
-      holdMinutes: conn.shortfallMinutes,
+      holdMinutes: requiredHoldMinutes,
     };
     holdActions.push(action);
     proposals.push({
       id: `hold-${conn.connectionId}-${conn.toFlightId}`,
-      title: `Protect ${conn.connectionId}: Hold ${conn.toFlightId} (+${conn.shortfallMinutes}m)`,
+      title: `Protect ${conn.connectionId}: Hold ${conn.toFlightId} (+${requiredHoldMinutes}m)`,
       category: 'CONNECTION_HOLD',
-      summary: `Hold ${conn.toFlightId} at ${conn.airport} by ${conn.shortfallMinutes}m to save ${conn.passengers} connecting passengers from ${conn.fromFlightId}.`,
+      summary: `Hold ${conn.toFlightId} at ${conn.airport} to STD+${requiredHoldMinutes}m to save ${conn.passengers} connecting passengers from ${conn.fromFlightId}.`,
       rationale: `Prioritizes passenger connection integrity on ${conn.connectionId} with minimal outbound delay trade-off.`,
       actions: [action],
     });

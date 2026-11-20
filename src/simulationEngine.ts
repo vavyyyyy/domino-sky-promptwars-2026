@@ -1,7 +1,7 @@
+import { validateClosureWindow } from './closureUtils';
 import {
   MINUTES_PER_DAY,
   formatMinutesToTime,
-  parseClosureTimeToMinutes,
   parseTimeToMinutes,
 } from './timeUtils';
 import type {
@@ -11,11 +11,13 @@ import type {
   ConnectionSimulationResult,
   CrewSimulationResult,
   DelayReason,
+  FlightHoldConstraint,
   FlightNetworkDataset,
   FlightSimulationResult,
   NormalizedClosure,
   RawFlight,
   SimulationKPIs,
+  SimulationOptions,
   SimulationResult,
 } from './types';
 
@@ -29,24 +31,24 @@ function normalizeClosures(
   closures: AirportClosureInput[],
   validAirportIds: ReadonlySet<string>
 ): NormalizedClosure[] {
-  const normalized = closures.map((closure) => {
-    if (!validAirportIds.has(closure.airportId)) {
-      throw new Error(`Closure references unknown airport "${closure.airportId}".`);
+  const seenKeys = new Set<string>();
+  const normalized: NormalizedClosure[] = closures.map((closure) => {
+    const check = validateClosureWindow(closure, validAirportIds);
+    if (!check.valid) {
+      throw new Error(check.error);
     }
-    const startMins = parseClosureTimeToMinutes(closure.startTime);
-    const endMins = parseClosureTimeToMinutes(closure.endTime);
-    if (endMins <= startMins) {
+
+    const dedupeKey = `${check.normalized.airportId}|${check.normalized.startMins}|${check.normalized.endMins}`;
+    if (seenKeys.has(dedupeKey)) {
       throw new Error(
-        `Invalid closure window for ${closure.airportId}: endTime (${closure.endTime}) must be after startTime (${closure.startTime}).`
+        `Duplicate closure: ${check.normalized.airportId} ${check.normalized.startTime}–${check.normalized.endTime} is already configured.`
       );
     }
+    seenKeys.add(dedupeKey);
+
     return {
       id: closure.id,
-      airportId: closure.airportId,
-      startTime: closure.startTime,
-      endTime: closure.endTime,
-      startMins,
-      endMins,
+      ...check.normalized,
     };
   });
 
@@ -69,7 +71,7 @@ function buildMergedClosuresByAirport(
   const byAirport = new Map<string, MergedClosureWindow[]>();
 
   for (const c of normalizedClosures) {
-    const label = `${c.startTime}-${c.endTime}`;
+    const label = c.isOvernight ? `${c.startTime}-${c.endTime}+1d` : `${c.startTime}-${c.endTime}`;
     const list = byAirport.get(c.airportId) ?? [];
     const last = list[list.length - 1];
 
@@ -92,11 +94,17 @@ function buildMergedClosuresByAirport(
   return byAirport;
 }
 
+interface ResolvedFlightHold {
+  holdMinutes: number;
+  connectionIds: string[];
+}
+
 function resolveFlightTiming(
   flight: RawFlight,
   prevFlightResult: FlightSimulationResult | null,
   minTurnaroundMinutes: number,
-  mergedClosuresByAirport: Map<string, MergedClosureWindow[]>
+  mergedClosuresByAirport: Map<string, MergedClosureWindow[]>,
+  holdConstraint?: ResolvedFlightHold
 ): FlightSimulationResult {
   const scheduledDepMins = parseTimeToMinutes(flight.dep);
   const scheduledArrMins = parseTimeToMinutes(flight.arr);
@@ -108,12 +116,25 @@ function resolveFlightTiming(
 
   if (prevFlightResult !== null) {
     const earliestByTurnaround = prevFlightResult.actualArrMins + minTurnaroundMinutes;
-    if (earliestByTurnaround > scheduledDepMins) {
+    if (earliestByTurnaround > actualDepMins) {
       actualDepMins = earliestByTurnaround;
       reasonSet.add('TURNAROUND_PROPAGATION');
       delayNotes.push(
         `Turnaround after ${prevFlightResult.flightId} (arr ${prevFlightResult.actualArr} + ${minTurnaroundMinutes}m)`
       );
+    }
+  }
+
+  if (holdConstraint && holdConstraint.holdMinutes > 0) {
+    const holdEarliestDepMins = scheduledDepMins + holdConstraint.holdMinutes;
+    if (holdEarliestDepMins > actualDepMins) {
+      actualDepMins = holdEarliestDepMins;
+      reasonSet.add('CONNECTION_HOLD');
+      const connSuffix =
+        holdConstraint.connectionIds.length > 0
+          ? ` (${holdConstraint.connectionIds.join(', ')})`
+          : '';
+      delayNotes.push(`Connection hold +${holdConstraint.holdMinutes}m${connSuffix}`);
     }
   }
 
@@ -385,13 +406,39 @@ function computeKPIs(
   };
 }
 
+function buildFlightHoldMap(
+  flightHolds?: FlightHoldConstraint[]
+): Map<string, ResolvedFlightHold> {
+  const map = new Map<string, ResolvedFlightHold>();
+  if (!flightHolds) return map;
+
+  for (const hold of flightHolds) {
+    if (!Number.isFinite(hold.holdMinutes) || hold.holdMinutes <= 0) continue;
+    const existing = map.get(hold.flightId);
+    if (existing) {
+      existing.holdMinutes += hold.holdMinutes;
+      if (hold.connectionId && !existing.connectionIds.includes(hold.connectionId)) {
+        existing.connectionIds.push(hold.connectionId);
+      }
+    } else {
+      map.set(hold.flightId, {
+        holdMinutes: hold.holdMinutes,
+        connectionIds: hold.connectionId ? [hold.connectionId] : [],
+      });
+    }
+  }
+  return map;
+}
+
 export function runSimulation(
   dataset: FlightNetworkDataset,
-  closureInputs: AirportClosureInput[] = []
+  closureInputs: AirportClosureInput[] = [],
+  options?: SimulationOptions
 ): SimulationResult {
   const validAirportIds = new Set(dataset.airports.map((a) => a.id));
   const normalizedClosures = normalizeClosures(closureInputs, validAirportIds);
   const mergedClosuresByAirport = buildMergedClosuresByAirport(normalizedClosures);
+  const flightHoldMap = buildFlightHoldMap(options?.flightHolds);
 
   // Group flights by aircraft tail and sort strictly by leg_order
   const flightsByTail = new Map<string, RawFlight[]>();
@@ -415,7 +462,8 @@ export function runSimulation(
         leg,
         prevLeg,
         dataset.meta.min_turnaround_minutes,
-        mergedClosuresByAirport
+        mergedClosuresByAirport,
+        flightHoldMap.get(leg.flight_id)
       );
       resolvedLegs.push(result);
       flightResultsById.set(result.flightId, result);

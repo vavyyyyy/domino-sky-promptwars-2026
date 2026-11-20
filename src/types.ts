@@ -79,12 +79,33 @@ export interface NormalizedClosure {
   endTime: string;
   startMins: number;
   endMins: number;
+  isOvernight: boolean;
+  durationMinutes: number;
+}
+
+export interface ClosurePreset {
+  id: string;
+  label: string;
+  airportId: string;
+  startTime: string;
+  endTime: string;
 }
 
 export type DelayReason =
   | 'ORIGIN_CLOSURE'
   | 'DESTINATION_CLOSURE'
-  | 'TURNAROUND_PROPAGATION';
+  | 'TURNAROUND_PROPAGATION'
+  | 'CONNECTION_HOLD';
+
+export interface FlightHoldConstraint {
+  flightId: string;
+  holdMinutes: number;
+  connectionId?: string;
+}
+
+export interface SimulationOptions {
+  flightHolds?: FlightHoldConstraint[];
+}
 
 export interface FlightSimulationResult {
   flightId: string;

@@ -14,11 +14,12 @@ import {
   Users,
   XCircle,
 } from 'lucide-react';
-import type { DominoTimelineEvent, TimelineStageKind } from '../types';
+import type { ClosurePreset, DominoTimelineEvent, TimelineStageKind } from '../types';
 
 interface DominoTimelinePanelProps {
   events: DominoTimelineEvent[];
   hasClosures: boolean;
+  presets?: ClosurePreset[];
   onTriggerPresetScenario?: (airportId: string, startTime: string, endTime: string) => void;
   onOpenSimulator?: () => void;
 }
@@ -26,9 +27,9 @@ interface DominoTimelinePanelProps {
 type StageFilter = 'ALL' | TimelineStageKind;
 
 export const DominoTimelinePanel: React.FC<DominoTimelinePanelProps> = React.memo(
-  ({ events, hasClosures, onTriggerPresetScenario, onOpenSimulator }) => {
+  ({ events, hasClosures, presets = [], onTriggerPresetScenario, onOpenSimulator }) => {
     const [stageFilter, setStageFilter] = useState<StageFilter>('ALL');
-    const [currentStep, setCurrentStep] = useState<number>(0);
+    const [currentStep, setCurrentStep] = useState<number>(events.length);
     const [isPlaying, setIsPlaying] = useState<boolean>(false);
     const [speedMs, setSpeedMs] = useState<number>(950);
 
@@ -37,11 +38,16 @@ export const DominoTimelinePanel: React.FC<DominoTimelinePanelProps> = React.mem
       return events.filter((e) => e.stageKind === stageFilter);
     }, [events, stageFilter]);
 
-    // Reset playback position cleanly when event count or filter changes
+    const filteredEventsSignature = useMemo(
+      () => filteredEvents.map((e) => e.id).join('|'),
+      [filteredEvents]
+    );
+
+    // Reset playback position cleanly when event sequence or filter changes
     useEffect(() => {
       setIsPlaying(false);
       setCurrentStep(filteredEvents.length > 0 ? filteredEvents.length : 0);
-    }, [filteredEvents.length, stageFilter]);
+    }, [filteredEvents.length, filteredEventsSignature, stageFilter]);
 
     useEffect(() => {
       if (!isPlaying || filteredEvents.length === 0) return;
@@ -165,24 +171,23 @@ export const DominoTimelinePanel: React.FC<DominoTimelinePanelProps> = React.mem
               </p>
             </div>
             <div className="flex flex-wrap items-center gap-2">
-              {onTriggerPresetScenario && (
-                <>
+              {onTriggerPresetScenario &&
+                presets.slice(0, 3).map((preset, idx) => (
                   <button
+                    key={preset.id}
                     type="button"
-                    onClick={() => onTriggerPresetScenario('BOM', '07:30', '09:30')}
-                    className="h-8 px-3 rounded bg-[#477F7A] hover:bg-[#3A6A66] text-white text-xs font-medium cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
+                    onClick={() =>
+                      onTriggerPresetScenario(preset.airportId, preset.startTime, preset.endTime)
+                    }
+                    className={
+                      idx === 0
+                        ? 'h-8 px-3 rounded bg-[#477F7A] hover:bg-[#3A6A66] text-white text-xs font-medium cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]'
+                        : 'h-8 px-3 rounded bg-white hover:bg-[#F3F5F7] text-[#253342] border border-[#DCE2E8] text-xs font-medium cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]'
+                    }
                   >
-                    Simulate BOM Closure (07:30–09:30)
+                    Simulate {preset.airportId} ({preset.startTime}–{preset.endTime})
                   </button>
-                  <button
-                    type="button"
-                    onClick={() => onTriggerPresetScenario('DEL', '08:00', '10:00')}
-                    className="h-8 px-3 rounded bg-white hover:bg-[#F3F5F7] text-[#253342] border border-[#DCE2E8] text-xs font-medium cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#477F7A]"
-                  >
-                    Simulate DEL Closure (08:00–10:00)
-                  </button>
-                </>
-              )}
+                ))}
               {onOpenSimulator && (
                 <button
                   type="button"
@@ -405,24 +410,26 @@ export const DominoTimelinePanel: React.FC<DominoTimelinePanelProps> = React.mem
                     : 'PREDICTED IMPACT';
 
               return (
-                <div
+                <button
                   key={evt.id}
+                  type="button"
+                  aria-current={isLatest ? 'step' : undefined}
                   onClick={() => {
                     setIsPlaying(false);
                     setCurrentStep(index + 1);
                   }}
-                  className={`px-4 py-2.5 flex items-start gap-3 text-xs cursor-pointer transition-colors ${
+                  className={`w-full text-left px-4 py-2.5 flex items-start gap-3 text-xs cursor-pointer transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#477F7A] ${
                     isLatest ? 'bg-[#477F7A]/6' : 'hover:bg-[#F7F9FB]'
                   }`}
                 >
                   {/* Timestamp Column */}
-                  <div className="w-20 shrink-0 font-mono tabular-nums pt-0.5">
+                  <span className="w-20 shrink-0 font-mono tabular-nums pt-0.5 block">
                     <span className="text-[#253342] font-semibold">{evt.timeLabel}</span>
                     <span className="block text-[10px] text-[#596775]">#{evt.sequence} IST</span>
-                  </div>
+                  </span>
 
                   {/* Event Type Icon */}
-                  <div className="pt-0.5 shrink-0">
+                  <span className="pt-0.5 shrink-0 block">
                     {evt.type === 'DISRUPTION_ORIGIN' && (
                       <Lock className="w-4 h-4 text-[#B94A48]" aria-hidden="true" />
                     )}
@@ -441,22 +448,22 @@ export const DominoTimelinePanel: React.FC<DominoTimelinePanelProps> = React.mem
                     {evt.type === 'RECOVERY_ACTION' && (
                       <ShieldCheck className="w-4 h-4 text-[#477F7A]" aria-hidden="true" />
                     )}
-                  </div>
+                  </span>
 
                   {/* Details */}
-                  <div className="min-w-0 flex-1 space-y-1">
-                    <div className="flex flex-wrap items-center gap-2">
+                  <span className="min-w-0 flex-1 space-y-1 block">
+                    <span className="flex flex-wrap items-center gap-2">
                       <span
                         className={`inline-flex items-center px-1.5 py-0.5 rounded border text-[10px] font-mono font-semibold ${badgeColor}`}
                       >
                         {stageLabel}
                       </span>
                       <span className="font-semibold text-[#253342]">{evt.title}</span>
-                    </div>
+                    </span>
 
-                    <p className="text-[#596775] leading-relaxed">{evt.description}</p>
+                    <span className="block text-[#596775] leading-relaxed">{evt.description}</span>
 
-                    <div className="flex flex-wrap items-center gap-3 text-[11px] font-mono text-[#596775]">
+                    <span className="flex flex-wrap items-center gap-3 text-[11px] font-mono text-[#596775]">
                       <span className="inline-flex items-center gap-1 text-[#253342]">
                         {evt.airportId}
                         {evt.targetAirportId && (
@@ -478,9 +485,9 @@ export const DominoTimelinePanel: React.FC<DominoTimelinePanelProps> = React.mem
                           Cause: {evt.causedByEventId.replace('evt-', '')}
                         </span>
                       )}
-                    </div>
-                  </div>
-                </div>
+                    </span>
+                  </span>
+                </button>
               );
             })
           )}
